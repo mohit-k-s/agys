@@ -70,21 +70,28 @@ if [ -n "$SOURCE_DIR" ] && [ -f "$SOURCE_DIR/agys" ]; then
     cp "$SOURCE_DIR/agys" "$TARGET_BIN"
 else
     # Remote install via curl | bash
-    RAW_URL="${AGYS_SOURCE_URL:-https://raw.githubusercontent.com/mohit-k-s/agys/main/agys}"
-    if [ "$RAW_URL" = "https://raw.githubusercontent.com/mohit-k-s/agys/main/agys" ] && [ -d .git ]; then
-        REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
-        if [[ "$REMOTE_URL" =~ github\.com[:/]([^/]+)/([^/.]+)(\.git)? ]]; then
-            REPO_USER="${BASH_REMATCH[1]}"
-            REPO_NAME="${BASH_REMATCH[2]}"
-            RAW_URL="https://raw.githubusercontent.com/${REPO_USER}/${REPO_NAME}/main/agys"
+    URLS=(
+        "${AGYS_SOURCE_URL:-https://github.com/mohit-k-s/agys/raw/main/agys}"
+        "https://raw.githubusercontent.com/mohit-k-s/agys/main/agys"
+    )
+
+    DOWNLOADED=false
+    for URL in "${URLS[@]}"; do
+        if command -v curl &>/dev/null; then
+            if curl -fsSL --connect-timeout 6 --retry 2 "$URL" -o "$TARGET_BIN" 2>/dev/null; then
+                DOWNLOADED=true
+                break
+            fi
+        elif command -v wget &>/dev/null; then
+            if wget -q --timeout=6 --tries=2 -O "$TARGET_BIN" "$URL" 2>/dev/null; then
+                DOWNLOADED=true
+                break
+            fi
         fi
-    fi
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$RAW_URL" -o "$TARGET_BIN"
-    elif command -v wget &>/dev/null; then
-        wget -qO "$TARGET_BIN" "$RAW_URL"
-    else
-        error "Neither curl nor wget found. Cannot download agys."
+    done
+
+    if [ "$DOWNLOADED" != true ]; then
+        error "Failed to download agys from remote URLs. Please check your network connection."
         exit 1
     fi
 fi
