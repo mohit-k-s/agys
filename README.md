@@ -49,7 +49,7 @@ When working in the Antigravity CLI, jumping back into previous contexts can be 
 Run the automated installer directly:
 
 ```bash
-curl -fsSL https://github.com/mohit-k-s/agys/raw/main/install.sh | bash
+curl -fsSL https://cdn.jsdelivr.net/gh/mohit-k-s/agys@main/install.sh | bash
 ```
 
 Or if you've already cloned the repository:

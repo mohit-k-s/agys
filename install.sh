@@ -71,7 +71,7 @@ if [ -n "$SOURCE_DIR" ] && [ -f "$SOURCE_DIR/agys" ]; then
 else
     # Remote install via curl | bash
     URLS=(
-        "${AGYS_SOURCE_URL:-https://github.com/mohit-k-s/agys/raw/main/agys}"
+        "${AGYS_SOURCE_URL:-https://cdn.jsdelivr.net/gh/mohit-k-s/agys@main/agys}"
         "https://raw.githubusercontent.com/mohit-k-s/agys/main/agys"
     )
 
