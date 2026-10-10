@@ -1,0 +1,686 @@
+#!/usr/bin/env python3
+"""
+agys - Antigravity CLI Session Explorer
+Browse, inspect, search, and resume past Antigravity CLI sessions.
+"""
+
+import sys
+import os
+import json
+import sqlite3
+import argparse
+import subprocess
+import curses
+import shutil
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+
+APP_DATA_DIR = os.path.expanduser("~/.gemini/antigravity-cli")
+DB_PATH = os.path.join(APP_DATA_DIR, "conversation_summaries.db")
+BRAIN_DIR = os.path.join(APP_DATA_DIR, "brain")
+
+# ANSI Color codes for CLI mode
+class Colors:
+    CYAN = "\033[96m"
+    BLUE = "\033[94m"
+    GREEN = "\033[92m"
+    YELLOW = "\033[93m"
+    RED = "\033[91m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RESET = "\033[0m"
+
+
+def format_relative_time(dt_str: str) -> str:
+    """Format ISO datetime string to relative time like '2h ago' or 'yesterday'."""
+    try:
+        # Handle formats with or without timezone
+        clean_str = dt_str.replace("Z", "+00:00")
+        if "+" in clean_str:
+            dt = datetime.fromisoformat(clean_str)
+        else:
+            dt = datetime.fromisoformat(clean_str).replace(tzinfo=timezone.utc)
+        
+        now = datetime.now(timezone.utc)
+        diff = now - dt
+
+        seconds = int(diff.total_seconds())
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            m = seconds // 60
+            return f"{m}m ago"
+        elif seconds < 86400:
+            h = seconds // 3600
+            return f"{h}h ago"
+        elif seconds < 172800:
+            return "yesterday"
+        elif seconds < 604800:
+            d = seconds // 86400
+            return f"{d}d ago"
+        else:
+            return dt.strftime("%b %d, %Y")
+    except Exception:
+        return dt_str[:16] if dt_str else "unknown"
+
+
+def clean_user_prompt(raw: str) -> str:
+    """Extract clean user request text from raw XML wrapped prompt."""
+    if not raw:
+        return ""
+    if "<USER_REQUEST>" in raw and "</USER_REQUEST>" in raw:
+        try:
+            return raw.split("<USER_REQUEST>")[1].split("</USER_REQUEST>")[0].strip()
+        except IndexError:
+            pass
+    return raw.strip()
+
+
+def load_sessions() -> List[Dict[str, Any]]:
+    """Load all sessions from conversation_summaries.db and supplement with transcript details."""
+    sessions = []
+    seen_ids = set()
+
+    if os.path.exists(DB_PATH):
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            query = """
+                SELECT conversation_id, title, preview, step_count, last_modified_time, 
+                       workspace_uris, status, agent_name, last_user_input_time
+                FROM conversation_summaries
+                ORDER BY last_modified_time DESC
+            """
+            for row in cursor.execute(query):
+                cid = row["conversation_id"]
+                seen_ids.add(cid)
+                workspaces = []
+                try:
+                    if row["workspace_uris"]:
+                        ws = json.loads(row["workspace_uris"])
+                        workspaces = [w.replace("file://", "") for w in ws]
+                except Exception:
+                    pass
+
+                sessions.append({
+                    "id": cid,
+                    "title": row["title"] or "Untitled Session",
+                    "preview": row["preview"] or "",
+                    "step_count": row["step_count"] or 0,
+                    "last_modified": row["last_modified_time"] or "",
+                    "workspaces": workspaces,
+                    "status": row["status"] or "",
+                    "agent": row["agent_name"] or "default",
+                    "prompts": [],
+                    "artifacts": [],
+                    "last_response": "",
+                })
+            conn.close()
+        except Exception as e:
+            pass
+
+    # Discover sessions from brain directory that might not be in DB
+    if os.path.exists(BRAIN_DIR):
+        try:
+            for item in os.listdir(BRAIN_DIR):
+                if item not in seen_ids and os.path.isdir(os.path.join(BRAIN_DIR, item)):
+                    sessions.append({
+                        "id": item,
+                        "title": f"Session {item[:8]}",
+                        "preview": "",
+                        "step_count": 0,
+                        "last_modified": "",
+                        "workspaces": [],
+                        "status": "",
+                        "agent": "default",
+                        "prompts": [],
+                        "artifacts": [],
+                        "last_response": "",
+                    })
+        except Exception:
+            pass
+
+    # Enrich each session with prompts and artifacts
+    for s in sessions:
+        cid = s["id"]
+        brain_path = os.path.join(BRAIN_DIR, cid)
+        
+        # Check artifacts
+        if os.path.exists(brain_path):
+            try:
+                for f in os.listdir(brain_path):
+                    if f.endswith(".md") and not f.startswith("."):
+                        s["artifacts"].append(f)
+            except Exception:
+                pass
+
+        # Check transcript
+        transcript_path = os.path.join(brain_path, ".system_generated", "logs", "transcript.jsonl")
+        if os.path.exists(transcript_path):
+            try:
+                with open(transcript_path, "r", encoding="utf-8", errors="replace") as tf:
+                    step_count = 0
+                    for line in tf:
+                        step_count += 1
+                        try:
+                            data = json.loads(line)
+                            step_type = data.get("type")
+                            if step_type == "USER_INPUT":
+                                raw_text = data.get("content", "")
+                                prompt_clean = clean_user_prompt(raw_text)
+                                if prompt_clean and prompt_clean not in s["prompts"]:
+                                    s["prompts"].append(prompt_clean)
+                            elif step_type == "PLANNER_RESPONSE":
+                                resp = data.get("content", "")
+                                if resp:
+                                    s["last_response"] = resp
+                        except Exception:
+                            continue
+                    if s["step_count"] == 0:
+                        s["step_count"] = step_count
+            except Exception:
+                pass
+
+        # If title is missing or generic, use first user prompt
+        if (s["title"] == "Untitled Session" or s["title"].startswith("Session ")) and s["prompts"]:
+            first_prompt = s["prompts"][0]
+            s["title"] = (first_prompt[:50] + "...") if len(first_prompt) > 50 else first_prompt
+
+    return sessions
+
+
+def load_full_transcript(cid: str) -> List[Dict[str, Any]]:
+    """Load and format full transcript steps for a conversation."""
+    steps = []
+    transcript_path = os.path.join(BRAIN_DIR, cid, ".system_generated", "logs", "transcript.jsonl")
+    if not os.path.exists(transcript_path):
+        return steps
+
+    with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            try:
+                step = json.loads(line)
+                steps.append(step)
+            except Exception:
+                continue
+    return steps
+
+
+def copy_to_clipboard(text: str) -> bool:
+    """Copy text to system clipboard (macOS pbcopy or Linux xclip/xsel)."""
+    try:
+        if sys.platform == "darwin":
+            p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return True
+        elif shutil.which("xclip"):
+            p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return True
+        elif shutil.which("xsel"):
+            p = subprocess.Popen(["xsel", "--clipboard", "--input"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def resume_session(cid: str):
+    """Resume the session using agy --conversation <id>."""
+    agy_bin = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+    if not os.path.exists(agy_bin) and not shutil.which("agy"):
+        print(f"{Colors.RED}Error: 'agy' command not found in PATH.{Colors.RESET}")
+        sys.exit(1)
+
+    print(f"{Colors.GREEN}Resuming session: {Colors.BOLD}{cid}{Colors.RESET}...")
+    os.execvp(agy_bin, [agy_bin, "--conversation", cid])
+
+
+# ==============================================================================
+# CLI COMMANDS (LIST, SHOW, SEARCH, RESUME)
+# ==============================================================================
+
+def cmd_list(args):
+    sessions = load_sessions()
+    if not sessions:
+        print("No Antigravity CLI sessions found.")
+        return
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}⚡ Antigravity CLI Sessions ({len(sessions)}){Colors.RESET}\n")
+    print(f"{Colors.BOLD}{'#':<3} {'ID':<38} {'STEPS':<7} {'UPDATED':<14} {'TITLE'}{Colors.RESET}")
+    print("─" * 90)
+
+    for idx, s in enumerate(sessions, 1):
+        rel_time = format_relative_time(s["last_modified"])
+        title = s["title"]
+        if len(title) > 42:
+            title = title[:39] + "..."
+        steps = f"{s['step_count']} stp"
+        
+        color = Colors.GREEN if idx == 1 else Colors.RESET
+        print(f"{Colors.DIM}{idx:<3}{Colors.RESET} {s['id']:<38} {Colors.YELLOW}{steps:<7}{Colors.RESET} {Colors.CYAN}{rel_time:<14}{Colors.RESET} {color}{title}{Colors.RESET}")
+    print()
+
+
+def cmd_show(args):
+    sessions = load_sessions()
+    query = args.id_or_index
+    target = None
+
+    if query.isdigit():
+        idx = int(query) - 1
+        if 0 <= idx < len(sessions):
+            target = sessions[idx]
+    else:
+        for s in sessions:
+            if s["id"].lower().startswith(query.lower()):
+                target = s
+                break
+
+    if not target:
+        print(f"{Colors.RED}Session '{query}' not found.{Colors.RESET}")
+        return
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}═════════════════════════════════════════════════════════════════════════{Colors.RESET}")
+    print(f" {Colors.BOLD}{Colors.GREEN}{target['title']}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}═════════════════════════════════════════════════════════════════════════{Colors.RESET}")
+    print(f"{Colors.BOLD}Conversation ID:{Colors.RESET} {target['id']}")
+    print(f"{Colors.BOLD}Last Modified:  {Colors.RESET} {target['last_modified']} ({format_relative_time(target['last_modified'])})")
+    print(f"{Colors.BOLD}Total Steps:    {Colors.RESET} {target['step_count']}")
+    if target["workspaces"]:
+        print(f"{Colors.BOLD}Workspaces:     {Colors.RESET} {', '.join(target['workspaces'])}")
+    if target["artifacts"]:
+        print(f"{Colors.BOLD}Artifacts:      {Colors.RESET} {', '.join(target['artifacts'])}")
+
+    print(f"\n{Colors.BOLD}{Colors.YELLOW}User Prompts ({len(target['prompts'])}):{Colors.RESET}")
+    for idx, p in enumerate(target["prompts"], 1):
+        clean = p.replace("\n", " ")
+        if len(clean) > 100:
+            clean = clean[:97] + "..."
+        print(f"  {Colors.DIM}{idx:2d}.{Colors.RESET} {clean}")
+
+    print(f"\n{Colors.DIM}Resume command:{Colors.RESET} agy --conversation {target['id']}\n")
+
+
+def cmd_search(args):
+    keyword = args.keyword.lower()
+    sessions = load_sessions()
+    matches = []
+
+    for s in sessions:
+        matched_prompts = [p for p in s["prompts"] if keyword in p.lower()]
+        title_match = keyword in s["title"].lower()
+        if title_match or matched_prompts:
+            matches.append((s, matched_prompts, title_match))
+
+    if not matches:
+        print(f"No sessions matching '{args.keyword}'.")
+        return
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}Search Results for '{args.keyword}' ({len(matches)} sessions):{Colors.RESET}\n")
+    for s, m_prompts, t_match in matches:
+        print(f"• {Colors.BOLD}{s['title']}{Colors.RESET} ({Colors.DIM}{s['id']}{Colors.RESET})")
+        print(f"  Updated: {format_relative_time(s['last_modified'])} | Steps: {s['step_count']}")
+        if m_prompts:
+            print(f"  Matching prompt: {Colors.YELLOW}\"{m_prompts[0][:80]}...\"{Colors.RESET}")
+        print()
+
+
+def cmd_resume(args):
+    sessions = load_sessions()
+    if not sessions:
+        print("No sessions to resume.")
+        return
+
+    if not args.query:
+        # Resume most recent
+        resume_session(sessions[0]["id"])
+        return
+
+    query = args.query.lower()
+    target_id = None
+
+    if query.isdigit():
+        idx = int(query) - 1
+        if 0 <= idx < len(sessions):
+            target_id = sessions[idx]["id"]
+    else:
+        for s in sessions:
+            if s["id"].lower().startswith(query) or query in s["title"].lower():
+                target_id = s["id"]
+                break
+
+    if target_id:
+        resume_session(target_id)
+    else:
+        print(f"No session matching '{args.query}'.")
+
+
+# ==============================================================================
+# INTERACTIVE TUI MODE (CURSES)
+# ==============================================================================
+
+def render_tui(stdscr):
+    # Setup curses colors and settings
+    curses.curs_set(0)
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_CYAN, -1)     # Cyan header / accents
+    curses.init_pair(2, curses.COLOR_GREEN, -1)    # Green active
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)   # Yellow highlights
+    curses.init_pair(4, curses.COLOR_BLACK, curses.COLOR_CYAN) # Inverted selection
+    curses.init_pair(5, curses.COLOR_WHITE, -1)    # Normal white
+    curses.init_pair(6, curses.COLOR_MAGENTA, -1)  # Magenta tags
+
+    sessions = load_sessions()
+    selected_idx = 0
+    filter_query = ""
+    status_msg = ""
+    show_transcript_mode = False
+    transcript_scroll = 0
+    transcript_lines = []
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        # Minimum terminal size guard
+        if h < 12 or w < 60:
+            stdscr.addstr(0, 0, "Terminal too small. Please enlarge.", curses.A_BOLD)
+            stdscr.refresh()
+            ch = stdscr.getch()
+            if ch == ord('q'):
+                break
+            continue
+
+        # Filtered session list
+        if filter_query:
+            filtered_sessions = [
+                s for s in sessions
+                if filter_query.lower() in s["title"].lower() or any(filter_query.lower() in p.lower() for p in s["prompts"])
+            ]
+        else:
+            filtered_sessions = sessions
+
+        if selected_idx >= len(filtered_sessions):
+            selected_idx = max(0, len(filtered_sessions) - 1)
+
+        # ----------------------------------------------------------------------
+        # Top Header Bar
+        # ----------------------------------------------------------------------
+        header_text = f" ⚡ ANTIGRAVITY SESSIONS EXPLORER (agys)  │  {len(filtered_sessions)} session(s) "
+        if filter_query:
+            header_text += f" │ Filter: '{filter_query}'"
+        stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+        stdscr.addstr(0, 0, header_text.ljust(w - 1)[:w - 1])
+        stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+
+        # ----------------------------------------------------------------------
+        # Transcript Viewer Overlay Mode
+        # ----------------------------------------------------------------------
+        if show_transcript_mode and filtered_sessions:
+            current_s = filtered_sessions[selected_idx]
+            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+            title_bar = f" Transcript: {current_s['title']} ({current_s['id'][:12]}) [Press 'Esc' or 'q' to return]"
+            stdscr.addstr(1, 0, title_bar[:w - 1])
+            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+            max_lines = h - 4
+            visible_lines = transcript_lines[transcript_scroll : transcript_scroll + max_lines]
+            for i, line in enumerate(visible_lines):
+                row = 2 + i
+                if row >= h - 2:
+                    break
+                # Colorize tags
+                if line.startswith("USER:"):
+                    stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+                    stdscr.addstr(row, 2, line[:w - 4])
+                    stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+                elif line.startswith("TOOL:"):
+                    stdscr.attron(curses.color_pair(3))
+                    stdscr.addstr(row, 2, line[:w - 4])
+                    stdscr.attroff(curses.color_pair(3))
+                elif line.startswith("THINKING:"):
+                    stdscr.attron(curses.A_DIM)
+                    stdscr.addstr(row, 2, line[:w - 4])
+                    stdscr.attroff(curses.A_DIM)
+                else:
+                    stdscr.addstr(row, 2, line[:w - 4])
+
+            # Bottom status
+            stdscr.attron(curses.color_pair(4))
+            bottom = f" Line {transcript_scroll+1}/{max(1, len(transcript_lines))} │ Scroll: ↑/↓, PgUp/PgDn, j/k │ Back: Esc/q "
+            stdscr.addstr(h - 1, 0, bottom.ljust(w - 1)[:w - 1])
+            stdscr.attroff(curses.color_pair(4))
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            if ch in (ord('q'), 27): # Esc or q
+                show_transcript_mode = False
+            elif ch in (curses.KEY_UP, ord('k')):
+                transcript_scroll = max(0, transcript_scroll - 1)
+            elif ch in (curses.KEY_DOWN, ord('j')):
+                if transcript_scroll + max_lines < len(transcript_lines):
+                    transcript_scroll += 1
+            elif ch in (curses.KEY_NPAGE, ord(' ')): # Page Down
+                transcript_scroll = min(max(0, len(transcript_lines) - max_lines), transcript_scroll + max_lines)
+            elif ch in (curses.KEY_PPAGE, ord('b')): # Page Up
+                transcript_scroll = max(0, transcript_scroll - max_lines)
+            continue
+
+        # ----------------------------------------------------------------------
+        # Split Screen Layout (Left: Session List, Right: Session Details)
+        # ----------------------------------------------------------------------
+        left_w = max(34, int(w * 0.38))
+        right_w = w - left_w - 1
+
+        # Draw vertical separator
+        for y in range(1, h - 2):
+            stdscr.addstr(y, left_w, "│", curses.A_DIM)
+
+        # --- Left Pane: Session List ---
+        list_h = h - 3
+        start_y = 1
+
+        if not filtered_sessions:
+            stdscr.addstr(2, 2, "No matching sessions.", curses.A_DIM)
+        else:
+            for i, s in enumerate(filtered_sessions):
+                if i >= list_h:
+                    break
+                y = start_y + i
+                is_selected = (i == selected_idx)
+                rel_time = format_relative_time(s["last_modified"])
+                title_max = left_w - 14
+                title = s["title"][:title_max]
+
+                if is_selected:
+                    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
+                    line_str = f" ▶ {title:<{title_max}} {rel_time:>8} "
+                    stdscr.addstr(y, 0, line_str[:left_w])
+                    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
+                else:
+                    stdscr.addstr(y, 1, f"  {title:<{title_max}}", curses.color_pair(5))
+                    stdscr.addstr(y, left_w - 9, f"{rel_time:>8}", curses.color_pair(1) | curses.A_DIM)
+
+        # --- Right Pane: Session Details ---
+        if filtered_sessions and 0 <= selected_idx < len(filtered_sessions):
+            s = filtered_sessions[selected_idx]
+            rx = left_w + 2
+            ry = 1
+
+            # Title
+            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+            stdscr.addstr(ry, rx, f"Title: {s['title']}"[:right_w - 3])
+            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+            ry += 1
+
+            # Conversation ID
+            stdscr.addstr(ry, rx, f"ID: {s['id']}", curses.A_DIM)
+            ry += 1
+
+            # Meta Pill
+            meta_str = f"Steps: {s['step_count']}  │  Updated: {s['last_modified'][:19]}  │  Prompts: {len(s['prompts'])}"
+            stdscr.attron(curses.color_pair(3))
+            stdscr.addstr(ry, rx, meta_str[:right_w - 3])
+            stdscr.attroff(curses.color_pair(3))
+            ry += 1
+
+            # Workspace
+            if s["workspaces"]:
+                ws_str = f"Workspace: {s['workspaces'][0]}"
+                stdscr.addstr(ry, rx, ws_str[:right_w - 3], curses.A_DIM)
+                ry += 1
+
+            # Artifacts
+            if s["artifacts"]:
+                art_str = f"Artifacts: {', '.join(s['artifacts'])}"
+                stdscr.attron(curses.color_pair(6))
+                stdscr.addstr(ry, rx, art_str[:right_w - 3])
+                stdscr.attroff(curses.color_pair(6))
+                ry += 1
+
+            stdscr.addstr(ry, rx, "─" * (right_w - 4), curses.A_DIM)
+            ry += 1
+
+            # Prompts timeline
+            stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+            stdscr.addstr(ry, rx, f"Prompts Timeline ({len(s['prompts'])} messages):")
+            stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+            ry += 1
+
+            max_prompt_lines = h - ry - 3
+            display_prompts = s["prompts"][:max_prompt_lines]
+            for p_idx, prompt in enumerate(display_prompts, 1):
+                clean_p = prompt.replace("\n", " ").strip()
+                max_chars = right_w - 8
+                if len(clean_p) > max_chars:
+                    clean_p = clean_p[:max_chars - 3] + "..."
+                stdscr.addstr(ry, rx, f"{p_idx:2d}. {clean_p}"[:right_w - 3])
+                ry += 1
+                if ry >= h - 3:
+                    break
+
+            if len(s["prompts"]) > len(display_prompts):
+                stdscr.addstr(ry, rx, f"... and {len(s['prompts']) - len(display_prompts)} more (Press 't' for full transcript)", curses.A_DIM)
+
+        # ----------------------------------------------------------------------
+        # Bottom Status / Keybindings Bar
+        # ----------------------------------------------------------------------
+        stdscr.attron(curses.color_pair(4))
+        if status_msg:
+            status_bar = f" {status_msg} "
+        else:
+            status_bar = " [ENTER] Resume in agy │ [T] Transcript │ [C] Copy ID │ [/] Filter │ [R] Refresh │ [Q] Quit "
+        stdscr.addstr(h - 1, 0, status_bar.ljust(w - 1)[:w - 1])
+        stdscr.attroff(curses.color_pair(4))
+
+        stdscr.refresh()
+        status_msg = ""
+
+        # Handle user keypress
+        ch = stdscr.getch()
+
+        if ch in (ord('q'), ord('Q')):
+            break
+        elif ch in (curses.KEY_UP, ord('k')):
+            selected_idx = max(0, selected_idx - 1)
+        elif ch in (curses.KEY_DOWN, ord('j')):
+            selected_idx = min(len(filtered_sessions) - 1, selected_idx + 1)
+        elif ch in (curses.KEY_ENTER, 10, 13):
+            if filtered_sessions and 0 <= selected_idx < len(filtered_sessions):
+                target_id = filtered_sessions[selected_idx]["id"]
+                curses.endwin()
+                resume_session(target_id)
+                return
+        elif ch in (ord('c'), ord('C')):
+            if filtered_sessions and 0 <= selected_idx < len(filtered_sessions):
+                cid = filtered_sessions[selected_idx]["id"]
+                if copy_to_clipboard(cid):
+                    status_msg = f"Copied ID to clipboard: {cid[:12]}..."
+                else:
+                    status_msg = f"ID: {cid}"
+        elif ch in (ord('t'), ord('T')):
+            if filtered_sessions and 0 <= selected_idx < len(filtered_sessions):
+                cid = filtered_sessions[selected_idx]["id"]
+                raw_steps = load_full_transcript(cid)
+                transcript_lines = []
+                for st in raw_steps:
+                    st_type = st.get("type")
+                    if st_type == "USER_INPUT":
+                        clean_req = clean_user_prompt(st.get("content", ""))
+                        transcript_lines.append("")
+                        transcript_lines.append(f"USER: {clean_req}")
+                    elif st_type == "PLANNER_RESPONSE":
+                        content = st.get("content", "")
+                        if content:
+                            transcript_lines.append("")
+                            for cl in content.split("\n"):
+                                transcript_lines.append(f"  {cl}")
+                        calls = st.get("tool_calls", [])
+                        for tc in calls:
+                            transcript_lines.append(f"TOOL: {tc.get('name')} {tc.get('args', {})}")
+                show_transcript_mode = True
+                transcript_scroll = 0
+        elif ch == ord('/'):
+            # Filter prompt
+            curses.echo()
+            curses.curs_set(1)
+            stdscr.attron(curses.color_pair(3) | curses.A_BOLD)
+            stdscr.addstr(h - 1, 0, " Filter query: ".ljust(w - 1))
+            stdscr.attroff(curses.color_pair(3) | curses.A_BOLD)
+            stdscr.refresh()
+            stdscr.move(h - 1, 15)
+            query_bytes = stdscr.getstr(h - 1, 15, 40)
+            filter_query = query_bytes.decode("utf-8").strip()
+            curses.noecho()
+            curses.curs_set(0)
+            selected_idx = 0
+        elif ch in (ord('r'), ord('R')):
+            sessions = load_sessions()
+            status_msg = "Sessions refreshed."
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="agys",
+        description="Antigravity CLI Session Explorer — browse, search, inspect, and resume agy sessions.",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Subcommands")
+
+    # list subcommand
+    subparsers.add_parser("list", aliases=["ls"], help="List all sessions in formatted table")
+
+    # show subcommand
+    show_parser = subparsers.add_parser("show", aliases=["view", "info"], help="Show session details and prompts")
+    show_parser.add_argument("id_or_index", help="Session ID or list index")
+
+    # search subcommand
+    search_parser = subparsers.add_parser("search", aliases=["find"], help="Full-text search sessions")
+    search_parser.add_argument("keyword", help="Search keyword")
+
+    # resume subcommand
+    resume_parser = subparsers.add_parser("resume", help="Resume a session directly in agy")
+    resume_parser.add_argument("query", nargs="?", default="", help="Session ID or search term (default: latest)")
+
+    args = parser.parse_args()
+
+    if args.command in ("list", "ls"):
+        cmd_list(args)
+    elif args.command in ("show", "view", "info"):
+        cmd_show(args)
+    elif args.command in ("search", "find"):
+        cmd_search(args)
+    elif args.command == "resume":
+        cmd_resume(args)
+    else:
+        # Launch Interactive TUI
+        try:
+            curses.wrapper(render_tui)
+        except KeyboardInterrupt:
+            pass
+
+
+if __name__ == "__main__":
+    main()
