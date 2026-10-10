@@ -49,14 +49,14 @@ When working in the Antigravity CLI, jumping back into previous contexts can be 
 Run the automated installer directly:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/your-username/agy-sessions/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mohit-k-s/agys/main/install.sh | bash
 ```
 
 Or if you've already cloned the repository:
 
 ```bash
-git clone https://github.com/your-username/agy-sessions.git
-cd agy-sessions
+git clone https://github.com/mohit-k-s/agys.git
+cd agys
 ./install.sh
 ```
 
@@ -70,8 +70,8 @@ The script will:
 ### Option 2: Manual Symlink
 
 ```bash
-git clone https://github.com/your-username/agy-sessions.git
-cd agy-sessions
+git clone https://github.com/mohit-k-s/agys.git
+cd agys
 chmod +x agys
 mkdir -p ~/.local/bin
 ln -sf "$(pwd)/agys" ~/.local/bin/agys

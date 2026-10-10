@@ -70,8 +70,8 @@ if [ -n "$SOURCE_DIR" ] && [ -f "$SOURCE_DIR/agys" ]; then
     cp "$SOURCE_DIR/agys" "$TARGET_BIN"
 else
     # Remote install via curl | bash
-    RAW_URL="${AGYS_SOURCE_URL:-https://raw.githubusercontent.com/your-username/agy-sessions/main/agys}"
-    if [ "$RAW_URL" = "https://raw.githubusercontent.com/your-username/agy-sessions/main/agys" ] && [ -d .git ]; then
+    RAW_URL="${AGYS_SOURCE_URL:-https://raw.githubusercontent.com/mohit-k-s/agys/main/agys}"
+    if [ "$RAW_URL" = "https://raw.githubusercontent.com/mohit-k-s/agys/main/agys" ] && [ -d .git ]; then
         REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
         if [[ "$REMOTE_URL" =~ github\.com[:/]([^/]+)/([^/.]+)(\.git)? ]]; then
             REPO_USER="${BASH_REMATCH[1]}"
