@@ -44,24 +44,40 @@ When working in the Antigravity CLI, jumping back into previous contexts can be 
 
 ## Installation
 
-### Option 1: Symlink to your user binaries (Recommended)
+### Option 1: One-Shot Install Script (Quickest)
 
-Clone the repository and link the executable to your local path:
+Run the automated installer directly:
 
 ```bash
-# Clone the repository
+curl -fsSL https://raw.githubusercontent.com/your-username/agy-sessions/main/install.sh | bash
+```
+
+Or if you've already cloned the repository:
+
+```bash
 git clone https://github.com/your-username/agy-sessions.git
 cd agy-sessions
+./install.sh
+```
 
-# Make executable
+The script will:
+- Check for Python 3.8+ and verify `agy` presence
+- Install `agys` to `~/.local/bin/agys`
+- Validate your `$PATH` and provide instructions if not yet configured
+
+---
+
+### Option 2: Manual Symlink
+
+```bash
+git clone https://github.com/your-username/agy-sessions.git
+cd agy-sessions
 chmod +x agys
-
-# Link to ~/.local/bin (ensure ~/.local/bin is in your $PATH)
 mkdir -p ~/.local/bin
 ln -sf "$(pwd)/agys" ~/.local/bin/agys
 ```
 
-### Option 2: Install system-wide
+### Option 3: System-Wide Install
 
 ```bash
 sudo cp agys /usr/local/bin/agys
